@@ -24,6 +24,12 @@ import torchvision.models as models
 
 import moco.loader
 import moco.builder
+from tensorboardX import SummaryWriter
+
+import netalexnet
+from folder import ImageFolderInstance
+from knn import kNN
+writer = SummaryWriter('runs/moco')
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -157,7 +163,8 @@ def main_worker(gpu, ngpus_per_node, args):
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = moco.builder.MoCo(
-        models.__dict__[args.arch],
+        # models.__dict__[args.arch],
+        netalexnet.alexnet,
         args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
     print(model)
 
@@ -218,52 +225,63 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # Data loading code
     traindir = os.path.join(args.data, 'train')
+    testdir = os.path.join(args.data, 'val')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
-    if args.aug_plus:
-        # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
-        augmentation = [
-            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
-            transforms.RandomApply([
-                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
-            ], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize
-        ]
-    else:
-        # MoCo v1's aug: the same as InstDisc https://arxiv.org/abs/1805.01978
-        augmentation = [
-            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize
-        ]
+    transform_train = transforms.Compose([
+        transforms.Resize(size=256),
+        transforms.RandomResizedCrop(size=224, scale=(0.2, 1.)),
+        transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    transform_test = transforms.Compose([
+        transforms.Resize(size=256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+
+    train_dataset = ImageFolderInstance('/data2/zyf/ImageNet/ILSVRC2012-100/train',
+                                            transform=transform_train, two_crop=True)
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     else:
         train_sampler = None
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+    # train_loader = torch.utils.data.DataLoader(
+    #     train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+    #     num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, drop_last=True)
+
+    test_dataset = ImageFolderInstance('/data2/zyf/ImageNet/ILSVRC2012-100/val',
+                                           transform=transform_test)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=100, shuffle=False, num_workers=args.workers, drop_last=True)
+
+    ndata = train_dataset.__len__()
+    print(ndata)
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
 
+        # print('*******************')
+        # acc = kNN(0, model, train_loader, test_loader, 200, 0.1, ndata, low_dim=128)
+        # print('+++++++++++++++++')
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args)
+
+        print('----------Evaluation---------')
+        start = time.time()
+        acc = kNN(0, model, train_loader, test_loader, 200, 0.1, ndata, low_dim=128)
+        print("Evaluation Time: '{}'s".format(time.time() - start))
+
+        writer.add_scalar('nn_acc', acc, epoch)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
@@ -273,6 +291,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'optimizer' : optimizer.state_dict(),
             }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
+
+    writer.close()
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -320,6 +340,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+    writer.add_scalar('top1', top1.avg, epoch)
+    writer.add_scalar('top5', top5.avg, epoch)
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
@@ -379,6 +401,7 @@ def adjust_learning_rate(optimizer, epoch, args):
             lr *= 0.1 if epoch >= milestone else 1.
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+    writer.add_scalar('lr', lr, epoch)
 
 
 def accuracy(output, target, topk=(1,)):

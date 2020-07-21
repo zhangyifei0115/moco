@@ -20,6 +20,8 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from tensorboardX import SummaryWriter
+writer = SummaryWriter('runs/moco-lc')
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -116,6 +118,8 @@ def main():
     else:
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
+
+    writer.close()
 
 
 def main_worker(gpu, ngpus_per_node, args):
@@ -287,6 +291,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, args)
+        writer.add_scalar('val-top1', acc1, epoch)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -355,6 +360,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+
+    writer.add_scalar('top1', top1.avg, epoch)
+    writer.add_scalar('top5', top5.avg, epoch)
 
 
 def validate(val_loader, model, criterion, args):
@@ -479,6 +487,8 @@ def adjust_learning_rate(optimizer, epoch, args):
         lr *= 0.1 if epoch >= milestone else 1.
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+
+    writer.add_scalar('lr', lr, epoch)
 
 
 def accuracy(output, target, topk=(1,)):
